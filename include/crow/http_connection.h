@@ -283,20 +283,6 @@ namespace crow
                     is_invalid_request = true;
                     res = response(400);
                 }
-				if (parser_.is_upgrade())
-				{
-					if (req.get_header_value("upgrade") == "h2c")
-					{
-						// TODO HTTP/2
-                        // currently, ignore upgrade header
-					}
-                    else
-                    {
-                        close_connection_ = true;
-                        handler_->handle_upgrade(req, res, std::move(adaptor_));
-                        return;
-                    }
-				}
             }
 
             CROW_LOG_INFO << "Request: " << boost::lexical_cast<std::string>(adaptor_.remote_endpoint()) << " " << this << " HTTP/" << parser_.http_major << "." << parser_.http_minor << ' '
@@ -389,11 +375,6 @@ namespace crow
 
             buffers_.clear();
             buffers_.reserve(4*(res.headers.size()+5)+3);
-
-            if (res.body.empty() && res.json_value.t() == json::type::Object)
-            {
-                res.body = json::dump(res.json_value);
-            }
 
             if (!statusCodes.count(res.code))
                 res.code = 500;

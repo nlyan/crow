@@ -13,7 +13,6 @@
 #include "crow/http_request.h"
 #include "crow/utility.h"
 #include "crow/logging.h"
-#include "crow/websocket.h"
 
 namespace crow
 {
@@ -28,28 +27,9 @@ namespace crow
         virtual ~BaseRule()
         {
         }
-        
-        virtual void validate() = 0;
-        std::unique_ptr<BaseRule> upgrade()
-        {
-            if (rule_to_upgrade_)
-                return std::move(rule_to_upgrade_);
-            return {};
-        }
 
+        virtual void validate() = 0;
         virtual void handle(const request&, response&, const routing_params&) = 0;
-        virtual void handle_upgrade(const request&, response& res, SocketAdaptor&&) 
-        {
-            res = response(404);
-            res.end();
-        }
-#ifdef CROW_ENABLE_SSL
-        virtual void handle_upgrade(const request&, response& res, SSLAdaptor&&) 
-        {
-            res = response(404);
-            res.end();
-        }
-#endif
 
         uint32_t get_methods()
         {
@@ -73,8 +53,6 @@ namespace crow
 
         std::string rule_;
         std::string name_;
-
-        std::unique_ptr<BaseRule> rule_to_upgrade_;
 
         friend class Router;
         template <typename T>
@@ -267,89 +245,10 @@ namespace crow
         }
     }
 
-    class WebSocketRule : public BaseRule
-    {
-        using self_t = WebSocketRule;
-    public:
-        WebSocketRule(std::string rule)
-            : BaseRule(std::move(rule))
-        {
-        }
-
-        void validate() override
-        {
-        }
-
-        void handle(const request&, response& res, const routing_params&) override
-        {
-            res = response(404);
-            res.end();
-        }
-
-        void handle_upgrade(const request& req, response&, SocketAdaptor&& adaptor) override 
-        {
-            new crow::websocket::Connection<SocketAdaptor>(req, std::move(adaptor), open_handler_, message_handler_, close_handler_, error_handler_, accept_handler_);
-        }
-#ifdef CROW_ENABLE_SSL
-        void handle_upgrade(const request& req, response&, SSLAdaptor&& adaptor) override
-        {
-            new crow::websocket::Connection<SSLAdaptor>(req, std::move(adaptor), open_handler_, message_handler_, close_handler_, error_handler_, accept_handler_);
-        }
-#endif
-
-        template <typename Func>
-        self_t& onopen(Func f)
-        {
-            open_handler_ = f;
-            return *this;
-        }
-
-        template <typename Func>
-        self_t& onmessage(Func f)
-        {
-            message_handler_ = f;
-            return *this;
-        }
-
-        template <typename Func>
-        self_t& onclose(Func f)
-        {
-            close_handler_ = f;
-            return *this;
-        }
-
-        template <typename Func>
-        self_t& onerror(Func f)
-        {
-            error_handler_ = f;
-            return *this;
-        }
-
-        template <typename Func>
-        self_t& onaccept(Func f)
-        {
-            accept_handler_ = f;
-            return *this;
-        }
-
-    protected:
-        std::function<void(crow::websocket::connection&)> open_handler_;
-        std::function<void(crow::websocket::connection&, const std::string&, bool)> message_handler_;
-        std::function<void(crow::websocket::connection&, const std::string&)> close_handler_;
-        std::function<void(crow::websocket::connection&)> error_handler_;
-        std::function<bool(const crow::request&)> accept_handler_;
-    };
-
     template <typename T>
     struct RuleParameterTraits
     {
         using self_t = T;
-        WebSocketRule& websocket() 
-        {
-            auto p =new WebSocketRule(((self_t*)this)->rule_);
-            ((self_t*)this)->rule_to_upgrade_.reset(p);
-            return *p;
-        }
 
         self_t& name(std::string name) noexcept
         {
@@ -474,7 +373,7 @@ namespace crow
                 black_magic::CallHelper<Func, black_magic::S<crow::request, Args...>>::value , 
                 "Handler type is mismatched with URL parameters");
             static_assert(!std::is_same<void, decltype(f(std::declval<Args>()...))>::value, 
-                "Handler function cannot have void return type; valid return types: string, int, crow::resposne, crow::json::wvalue");
+                "Handler function cannot have void return type; valid return types: string, int, crow::resposne");
 
             handler_ = (
 #ifdef CROW_CAN_USE_CPP14
@@ -499,7 +398,7 @@ namespace crow
                 black_magic::CallHelper<Func, black_magic::S<crow::request, Args...>>::value, 
                 "Handler type is mismatched with URL parameters");
             static_assert(!std::is_same<void, decltype(f(std::declval<crow::request>(), std::declval<Args>()...))>::value, 
-                "Handler function cannot have void return type; valid return types: string, int, crow::resposne, crow::json::wvalue");
+                "Handler function cannot have void return type; valid return types: string, int, crow::resposne");
 
             handler_ = (
 #ifdef CROW_CAN_USE_CPP14
@@ -946,9 +845,6 @@ public:
             {
                 if (rule)
                 {
-                    auto upgraded = rule->upgrade();
-                    if (upgraded)
-                        rule = std::move(upgraded);
                     rule->validate();
                     internal_add_rule_object(rule->rule(), rule.get());
                 }
@@ -956,69 +852,6 @@ public:
             for(auto& per_method:per_methods_)
             {
                 per_method.trie.validate();
-            }
-        }
-
-        template <typename Adaptor> 
-        void handle_upgrade(const request& req, response& res, Adaptor&& adaptor)
-        {
-            if (req.method >= HTTPMethod::InternalMethodCount)
-                return;
-            auto& per_method = per_methods_[(int)req.method];
-            auto& trie = per_method.trie;
-            auto& rules = per_method.rules;
-
-            auto found = trie.find(req.url);
-            unsigned rule_index = found.first;
-            if (!rule_index)
-            {
-                CROW_LOG_DEBUG << "Cannot match rules " << req.url << ' ' << method_name(req.method);
-                res = response(404);
-                res.end();
-                return;
-            }
-
-            if (rule_index >= rules.size())
-                throw std::runtime_error("Trie internal structure corrupted!");
-
-            if (rule_index == RULE_SPECIAL_REDIRECT_SLASH)
-            {
-                CROW_LOG_INFO << "Redirecting to a url with trailing slash: " << req.url;
-                res = response(301);
-
-                // TODO absolute url building
-                if (req.get_header_value("Host").empty())
-                {
-                    res.add_header("Location", req.url + "/");
-                }
-                else
-                {
-                    res.add_header("Location", "http://" + req.get_header_value("Host") + req.url + "/");
-                }
-                res.end();
-                return;
-            }
-
-            CROW_LOG_DEBUG << "Matched rule (upgrade) '" << rules[rule_index]->rule_ << "' " << (uint32_t)req.method << " / " << rules[rule_index]->get_methods();
-
-            // any uncaught exceptions become 500s
-            try
-            {
-                rules[rule_index]->handle_upgrade(req, res, std::move(adaptor));
-            }
-            catch(std::exception& e)
-            {
-                CROW_LOG_ERROR << "An uncaught exception occurred: " << e.what();
-                res = response(500);
-                res.end();
-                return;   
-            }
-            catch(...)
-            {
-                CROW_LOG_ERROR << "An uncaught exception occurred. The type was unknown so no information was available.";
-                res = response(500);
-                res.end();
-                return;   
             }
         }
 
