@@ -192,6 +192,8 @@ namespace crow
                         {
                             p->start();
                         });
+                    } else {
+                        delete p;
                     }
                     do_accept();
                 });
